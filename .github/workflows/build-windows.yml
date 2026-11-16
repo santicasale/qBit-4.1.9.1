@@ -1,0 +1,197 @@
+name: Build qBittorrent 4.1.9.1 (Windows x64)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+
+env:
+  BOOST_VERSION: "1.78.0"
+  LT_VERSION: "1.2.19"
+  QT_VERSION: "5.15.2"
+  PATCH_FILE: patches/qbittorrent-4.1.9.1-bigtorrent-filter.patch
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ---------------------------------------------------------------
+      # 1. Apply the patch (big torrents + file filter) if not applied yet
+      # ---------------------------------------------------------------
+      - name: Apply patch
+        shell: bash
+        run: |
+          if [ ! -f "$PATCH_FILE" ]; then
+            echo "::error::Patch file '$PATCH_FILE' not found in the repository."
+            exit 1
+          fi
+          OPTS="--ignore-space-change --ignore-whitespace"
+          if git apply $OPTS --reverse --check "$PATCH_FILE" 2>/dev/null; then
+            echo "Patch is already applied in the sources, skipping."
+          else
+            git apply $OPTS --check "$PATCH_FILE"
+            git apply $OPTS "$PATCH_FILE"
+            echo "Patch applied."
+          fi
+          git status --short
+
+      # ---------------------------------------------------------------
+      # 2. Toolchain: MSVC x64 + Qt 5.15.2
+      # ---------------------------------------------------------------
+      - name: Setup MSVC (x64)
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: ${{ env.QT_VERSION }}
+          host: windows
+          target: desktop
+          arch: win64_msvc2019_64
+          modules: qtwinextras
+          cache: true
+
+      # ---------------------------------------------------------------
+      # 3. Dependencies (cached): Boost headers, OpenSSL, zlib, libtorrent
+      # ---------------------------------------------------------------
+      - name: Cache dependencies
+        id: cache-deps
+        uses: actions/cache@v4
+        with:
+          path: C:/deps
+          key: deps-win64-boost${{ env.BOOST_VERSION }}-lt${{ env.LT_VERSION }}-${{ hashFiles('.github/workflows/build-windows.yml') }}
+
+      - name: Install OpenSSL and zlib (vcpkg)
+        if: steps.cache-deps.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path C:/deps | Out-Null
+          & "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install `
+            --triplet x64-windows-static-md `
+            --x-install-root=C:/deps/vcpkg `
+            openssl zlib
+          if ($LASTEXITCODE -ne 0) { throw "vcpkg failed" }
+
+      - name: Download Boost headers
+        if: steps.cache-deps.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $v = $env:BOOST_VERSION.Replace('.', '_')
+          $url = "https://archives.boost.io/release/$env:BOOST_VERSION/source/boost_$v.zip"
+          Invoke-WebRequest -Uri $url -OutFile boost.zip -MaximumRetryCount 5 -RetryIntervalSec 10
+          7z x boost.zip -oC:/deps -bso0 -bsp0
+          if (-not (Test-Path "C:/deps/boost_$v/boost/version.hpp")) { throw "Boost extraction failed" }
+          Remove-Item boost.zip
+
+      - name: Build libtorrent
+        if: steps.cache-deps.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $v = $env:BOOST_VERSION.Replace('.', '_')
+          $url = "https://github.com/arvidn/libtorrent/releases/download/v$env:LT_VERSION/libtorrent-rasterbar-$env:LT_VERSION.tar.gz"
+          Invoke-WebRequest -Uri $url -OutFile lt.tar.gz -MaximumRetryCount 5 -RetryIntervalSec 10
+          tar -xzf lt.tar.gz
+          $src = "$PWD/libtorrent-rasterbar-$env:LT_VERSION"
+
+          cmake -S $src -B build-lt -G "Visual Studio 17 2022" -A x64 `
+            -DCMAKE_POLICY_VERSION_MINIMUM=3.5 `
+            -DCMAKE_INSTALL_PREFIX=C:/deps/libtorrent `
+            -DBUILD_SHARED_LIBS=OFF -Dstatic_runtime=OFF `
+            -Dbuild_tests=OFF -Dbuild_examples=OFF -Dbuild_tools=OFF -Dpython-bindings=OFF `
+            -Ddeprecated-functions=ON -Dencryption=ON `
+            -DBOOST_ROOT=C:/deps/boost_$v -DBoost_NO_BOOST_CMAKE=ON -DBoost_USE_STATIC_LIBS=ON `
+            -DOPENSSL_ROOT_DIR=C:/deps/vcpkg/x64-windows-static-md -DOPENSSL_USE_STATIC_LIBS=ON
+          if ($LASTEXITCODE -ne 0) { throw "libtorrent configure failed" }
+
+          cmake --build build-lt --config Release --parallel 4
+          if ($LASTEXITCODE -ne 0) { throw "libtorrent build failed" }
+
+          cmake --install build-lt --config Release
+          if ($LASTEXITCODE -ne 0) { throw "libtorrent install failed" }
+
+          Get-ChildItem C:/deps/libtorrent/lib -Recurse | Select-Object FullName
+
+      # ---------------------------------------------------------------
+      # 4. conf.pri for qmake
+      # ---------------------------------------------------------------
+      - name: Generate conf.pri
+        shell: pwsh
+        run: |
+          $v = $env:BOOST_VERSION.Replace('.', '_')
+          $vcpkg = "C:/deps/vcpkg/x64-windows-static-md"
+
+          # Take the compile definitions libtorrent exports so both sides use the same ABI
+          $defs = @()
+          $targets = Get-ChildItem C:/deps/libtorrent -Recurse -Filter "LibtorrentRasterbarTargets.cmake" | Select-Object -First 1
+          if ($targets) {
+            $text = Get-Content -Raw $targets.FullName
+            $m = [regex]::Match($text, 'INTERFACE_COMPILE_DEFINITIONS\s+"([^"]*)"')
+            if ($m.Success) {
+              $defs = $m.Groups[1].Value.Split(';') | Where-Object { $_ -and ($_ -notmatch '^\$<') }
+            }
+          }
+          if (-not $defs -or $defs.Count -eq 0) {
+            Write-Warning "Could not read libtorrent definitions, using defaults"
+            $defs = @('BOOST_ASIO_ENABLE_CANCELIO','BOOST_ASIO_NO_DEPRECATED','_FILE_OFFSET_BITS=64',
+                      'TORRENT_USE_OPENSSL','TORRENT_USE_LIBCRYPTO','_WIN32_WINNT=0x0601',
+                      'WIN32_LEAN_AND_MEAN','UNICODE','_UNICODE')
+          }
+          # winconf.pri already defines these; avoid redefinition warnings
+          $defs = $defs | Where-Object { $_ -notmatch '^(UNICODE|_UNICODE|WIN32_LEAN_AND_MEAN|_FILE_OFFSET_BITS=.*)$' }
+
+          $lines = @()
+          $lines += "INCLUDEPATH += C:/deps/boost_$v"
+          $lines += "INCLUDEPATH += C:/deps/libtorrent/include"
+          $lines += "INCLUDEPATH += $vcpkg/include"
+          $lines += "LIBS += -LC:/deps/libtorrent/lib"
+          $lines += "LIBS += -L$vcpkg/lib"
+          $lines += "LIBS += torrent-rasterbar.lib libssl.lib libcrypto.lib zlib.lib"
+          $lines += "LIBS += ws2_32.lib wsock32.lib iphlpapi.lib bcrypt.lib"
+          $lines += "DEFINES += BOOST_ALL_NO_LIB"
+          foreach ($d in $defs) { $lines += "DEFINES += $d" }
+          $lines += "CONFIG += stacktrace"
+          $lines += "QMAKE_CXXFLAGS += /MP"
+          $lines | Set-Content -Encoding ascii conf.pri
+          Get-Content conf.pri
+
+      # ---------------------------------------------------------------
+      # 5. Build qBittorrent
+      # ---------------------------------------------------------------
+      - name: Build qBittorrent
+        shell: pwsh
+        run: |
+          qmake qbittorrent.pro -spec win32-msvc "CONFIG+=release" "CONFIG-=debug_and_release"
+          if ($LASTEXITCODE -ne 0) { throw "qmake failed" }
+          nmake
+          if ($LASTEXITCODE -ne 0) { throw "nmake failed" }
+
+      # ---------------------------------------------------------------
+      # 6. Package
+      # ---------------------------------------------------------------
+      - name: Package
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem src -Recurse -Filter qbittorrent.exe | Select-Object -First 1
+          if (-not $exe) { throw "qbittorrent.exe not found" }
+          $out = "qBittorrent-4.1.9.1-custom-win64"
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          Copy-Item $exe.FullName $out
+          windeployqt --release --compiler-runtime --no-opengl-sw --no-angle --no-system-d3d-compiler "$out/qbittorrent.exe"
+          if ($LASTEXITCODE -ne 0) { throw "windeployqt failed" }
+          Get-ChildItem $out -Recurse -File | Measure-Object -Property Length -Sum
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: qBittorrent-4.1.9.1-custom-win64
+          path: qBittorrent-4.1.9.1-custom-win64
+          if-no-files-found: error
