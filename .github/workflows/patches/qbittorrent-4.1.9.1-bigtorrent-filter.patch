@@ -1,0 +1,145 @@
+diff -ru a/src/base/bittorrent/session.cpp b/src/base/bittorrent/session.cpp
+--- a/src/base/bittorrent/session.cpp	2019-10-31 20:12:08.000000000 +0000
++++ b/src/base/bittorrent/session.cpp	2026-11-15 06:41:10.314974473 +0000
+@@ -2251,6 +2251,33 @@
+             // Make sure the torrent will be initially checked and then paused
+             // to perform some service jobs on it. We will start it if needed.
+             // (Workaround to easily support libtorrent-1.1)
++#if LIBTORRENT_VERSION_NUM >= 10200
++            // libtorrent parses `p.resume_data` internally with default bdecode limits, which fails with
++            // "bencoded item count limit exceeded" for huge torrents. Parse it here with larger limits.
++            bool resumeParsed = false;
++            {
++                libt::error_code ec;
++                libt::bdecode_node resumeNode;
++                libt::bdecode(fastresumeData.constData(), (fastresumeData.constData() + fastresumeData.size())
++                    , resumeNode, ec, nullptr, 100, 10000000);
++                if (!ec && (resumeNode.type() == libt::bdecode_node::dict_t)) {
++                    libt::add_torrent_params resumeParams = libt::read_resume_data(resumeNode, ec);
++                    if (!ec) {
++                        resumeParams.ti = p.ti;
++                        p = std::move(resumeParams);
++                        resumeParsed = true;
++                    }
++                }
++            }
++            if (!resumeParsed) {
++                QByteArray patchedFastresumeData = fastresumeData;
++                patchedFastresumeData.replace("6:pausedi0e", "6:pausedi1e");
++                patchedFastresumeData.replace("12:auto_managedi0e", "12:auto_managedi1e");
++                p.resume_data = std::vector<char> {patchedFastresumeData.constData()
++                    , (patchedFastresumeData.constData() + patchedFastresumeData.size())};
++                p.flags |= libt::add_torrent_params::flag_use_resume_save_path;
++            }
++#else
+             QByteArray patchedFastresumeData = fastresumeData;
+             patchedFastresumeData.replace("6:pausedi0e", "6:pausedi1e");
+             patchedFastresumeData.replace("12:auto_managedi0e", "12:auto_managedi1e");
+@@ -2258,6 +2285,7 @@
+             p.resume_data = std::vector<char> {patchedFastresumeData.constData()
+                 , (patchedFastresumeData.constData() + patchedFastresumeData.size())};
+             p.flags |= libt::add_torrent_params::flag_use_resume_save_path;
++#endif
+         }
+         else {
+             p.file_priorities = {params.filePriorities.begin(), params.filePriorities.end()};
+@@ -4668,7 +4696,8 @@
+         if (ec || (fast.type() != libt::lazy_entry::dict_t)) return false;
+ #else
+         libt::bdecode_node fast;
+-        libt::bdecode(data.constData(), data.constData() + data.size(), fast, ec);
++        // Raise default limits (depth 100 / tokens 2,000,000) so that resume data of huge torrents can be parsed
++        libt::bdecode(data.constData(), data.constData() + data.size(), fast, ec, nullptr, 100, 10000000);
+         if (ec || (fast.type() != libt::bdecode_node::dict_t)) return false;
+ #endif
+ 
+diff -ru a/src/gui/addnewtorrentdialog.cpp b/src/gui/addnewtorrentdialog.cpp
+--- a/src/gui/addnewtorrentdialog.cpp	2019-10-31 20:12:08.000000000 +0000
++++ b/src/gui/addnewtorrentdialog.cpp	2026-11-15 06:41:27.669493023 +0000
+@@ -36,6 +36,7 @@
+ #include <QShortcut>
+ #include <QString>
+ #include <QUrl>
++#include <QVBoxLayout>
+ #include <QVector>
+ 
+ #include "base/bittorrent/filepriority.h"
+@@ -53,6 +54,7 @@
+ #include "base/utils/string.h"
+ #include "autoexpandabledialog.h"
+ #include "guiiconprovider.h"
++#include "lineedit.h"
+ #include "proplistdelegate.h"
+ #include "raisedmessagebox.h"
+ #include "torrentcontentfiltermodel.h"
+@@ -150,6 +152,22 @@
+             m_ui->categoryComboBox->addItem(category);
+ 
+     m_ui->contentTreeView->header()->setSortIndicator(0, Qt::AscendingOrder);
++
++    // Torrent content filtering: wrap the tree view together with a filter box inside the splitter
++    {
++        const int treeIndex = m_ui->splitter->indexOf(m_ui->contentTreeView);
++        auto *container = new QWidget(this);
++        container->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
++        auto *containerLayout = new QVBoxLayout(container);
++        containerLayout->setContentsMargins(0, 0, 0, 0);
++        m_filterLine = new LineEdit(container);
++        m_filterLine->setPlaceholderText(tr("Filter files..."));
++        containerLayout->addWidget(m_filterLine);
++        containerLayout->addWidget(m_ui->contentTreeView);
++        m_ui->splitter->insertWidget(treeIndex, container);
++        connect(m_filterLine, &LineEdit::textChanged, this, &AddNewTorrentDialog::filterContent);
++    }
++
+     loadState();
+     // Signal / slots
+     connect(m_ui->doNotDeleteTorrentCheckBox, &QCheckBox::clicked, this, &AddNewTorrentDialog::doNotDeleteTorrentClicked);
+@@ -636,6 +654,20 @@
+     updateDiskSpaceLabel();
+ }
+ 
++void AddNewTorrentDialog::filterContent(const QString &filter)
++{
++    if (!m_contentModel) return;
++
++    m_contentModel->setFilterRegExp(QRegExp(filter, Qt::CaseInsensitive, QRegExp::WildcardUnix));
++    if (filter.isEmpty()) {
++        m_ui->contentTreeView->collapseAll();
++        m_ui->contentTreeView->expand(m_contentModel->index(0, 0));
++    }
++    else {
++        m_ui->contentTreeView->expandAll();
++    }
++}
++
+ void AddNewTorrentDialog::handleDownloadFailed(const QString &url, const QString &reason)
+ {
+     RaisedMessageBox::critical(this, tr("Download Error"),
+diff -ru a/src/gui/addnewtorrentdialog.h b/src/gui/addnewtorrentdialog.h
+--- a/src/gui/addnewtorrentdialog.h	2019-10-31 20:12:08.000000000 +0000
++++ b/src/gui/addnewtorrentdialog.h	2026-11-15 06:41:29.986683468 +0000
+@@ -47,6 +47,7 @@
+     class AddNewTorrentDialog;
+ }
+ 
++class LineEdit;
+ class PropListDelegate;
+ class TorrentContentFilterModel;
+ class TorrentFileGuard;
+@@ -74,6 +75,7 @@
+ private slots:
+     void displayContentTreeMenu(const QPoint &);
+     void updateDiskSpaceLabel();
++    void filterContent(const QString &filter);
+     void onSavePathChanged(const QString &newPath);
+     void updateMetadata(const BitTorrent::TorrentInfo &info);
+     void handleDownloadFailed(const QString &url, const QString &reason);
+@@ -104,6 +106,7 @@
+     Ui::AddNewTorrentDialog *m_ui;
+     TorrentContentFilterModel *m_contentModel;
+     PropListDelegate *m_contentDelegate;
++    LineEdit *m_filterLine = nullptr;
+     bool m_hasMetadata;
+     QString m_filePath;
+     BitTorrent::InfoHash m_hash;
