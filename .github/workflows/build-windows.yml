@@ -20,7 +20,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       # ---------------------------------------------------------------
       # 1. Apply the patch (big torrents + file filter) if not applied yet
@@ -28,18 +28,20 @@ jobs:
       - name: Apply patch
         shell: bash
         run: |
+          # Already patched sources (changes committed directly to the repo)?
+          if grep -q "filterContent" src/gui/addnewtorrentdialog.cpp \
+             && grep -q "10000000" src/base/bittorrent/session.cpp; then
+            echo "Sources already contain the patch, skipping."
+            exit 0
+          fi
           if [ ! -f "$PATCH_FILE" ]; then
-            echo "::error::Patch file '$PATCH_FILE' not found in the repository."
+            echo "::error::Sources are not patched and '$PATCH_FILE' was not found in the repository."
             exit 1
           fi
           OPTS="--ignore-space-change --ignore-whitespace"
-          if git apply $OPTS --reverse --check "$PATCH_FILE" 2>/dev/null; then
-            echo "Patch is already applied in the sources, skipping."
-          else
-            git apply $OPTS --check "$PATCH_FILE"
-            git apply $OPTS "$PATCH_FILE"
-            echo "Patch applied."
-          fi
+          git apply $OPTS --check "$PATCH_FILE"
+          git apply $OPTS "$PATCH_FILE"
+          echo "Patch applied."
           git status --short
 
       # ---------------------------------------------------------------
@@ -50,9 +52,15 @@ jobs:
         with:
           arch: x64
 
+      - name: Setup Python (for aqtinstall)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
       - name: Install Qt
         uses: jurplel/install-qt-action@v4
         with:
+          setup-python: false
           version: ${{ env.QT_VERSION }}
           host: windows
           target: desktop
